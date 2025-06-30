@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# Claude Code Docker runner for macOS and WSL2 with multi-language support
+
+set -euo pipefail
+
+IMAGE_NAME="claude-code-dev:embedded"
+CONTAINER_NAME="claude-code-runner"
+USER_ID=$(id -u)
+GROUP_ID=$(id -g)
+USER_NAME="claude"
+
+# Languages array
+declare -a LANGUAGES=()
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -l|--lang|--language)
+      LANGUAGES+=("$2")
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  -l, --lang, --language <lang>  Specify language/platform (can be used multiple times)"
+      echo "  -h, --help                     Show this help message"
+      echo ""
+      echo "Supported languages:"
+      echo "  python  - Python with pip, poetry, virtualenv"
+      echo "  go      - Go with go modules support"
+      echo "  rust    - Rust with cargo"
+      echo "  dotnet  - .NET Core/.NET 5+"
+      echo "  node    - Node.js with npm, yarn, pnpm"
+      echo "  java    - Java with Maven and Gradle"
+      echo "  ruby    - Ruby with bundler"
+      echo "  php     - PHP with composer"
+      echo ""
+      echo "Examples:"
+      echo "  $0                              # Auto-detect language"
+      echo "  $0 --lang python                # Python only"
+      echo "  $0 --lang python --lang go      # Python and Go"
+      echo "  $0 -l rust -l python -l node    # Rust, Python, and Node.js"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Use --help for usage information"
+      exit 1
+      ;;
+  esac
+done
+
+# Auto-detect language if no languages specified
+detect_language() {
+  local detected=()
+  
+  if [[ -f "requirements.txt" ]] || [[ -f "setup.py" ]] || [[ -f "pyproject.toml" ]] || [[ -f "Pipfile" ]]; then
+    detected+=("python")
+  fi
+  if [[ -f "go.mod" ]] || [[ -f "go.sum" ]]; then
+    detected+=("go")
+  fi
+  if [[ -f "Cargo.toml" ]] || [[ -f "Cargo.lock" ]]; then
+    detected+=("rust")
+  fi
+  if ls *.csproj *.fsproj *.vbproj *.sln global.json 2>/dev/null | grep -q .; then
+    detected+=("dotnet")
+  fi
+  if [[ -f "package.json" ]] || [[ -f "yarn.lock" ]] || [[ -f "pnpm-lock.yaml" ]]; then
+    detected+=("node")
+  fi
+  if [[ -f "pom.xml" ]] || [[ -f "build.gradle" ]] || [[ -f "build.gradle.kts" ]]; then
+    detected+=("java")
+  fi
+  if [[ -f "Gemfile" ]] || [[ -f "Gemfile.lock" ]] || ls *.gemspec 2>/dev/null | grep -q .; then
+    detected+=("ruby")
+  fi
+  if [[ -f "composer.json" ]] || [[ -f "composer.lock" ]]; then
+    detected+=("php")
+  fi
+  
+  # If nothing detected, default to python
+  if [[ ${#detected[@]} -eq 0 ]]; then
+    detected+=("python")
+  fi
+  
+  printf '%s\n' "${detected[@]}"
+}
+
+# If no languages specified, auto-detect
+if [[ ${#LANGUAGES[@]} -eq 0 ]]; then
+  # Portable alternative to mapfile
+  LANGUAGES=()
+  while IFS= read -r lang; do
+    LANGUAGES+=("$lang")
+  done < <(detect_language)
+  echo "[info] Auto-detected languages: ${LANGUAGES[*]}"
+else
+  # Remove duplicates from LANGUAGES array
+  LANGUAGES=($(printf '%s\n' "${LANGUAGES[@]}" | sort -u))
+  echo "[info] Building environment for: ${LANGUAGES[*]}"
+fi
+
+# Host paths
+HOST_CACHE_DIR="$HOME/.claude-docker/cache"
+HOST_HOME_CLAUDE="$HOME/.claude"
+HOST_CLAUDE_JSON="$HOME/.claude.json"
+CREDENTIALS_JSON="$HOST_HOME_CLAUDE/.credentials.json"
+
+mkdir -p "$HOST_CACHE_DIR" "$HOST_HOME_CLAUDE"
+touch "$HOST_CLAUDE_JSON"
+
+# Conditionally extract credentials from Keychain (macOS only)
+if [[ "$(uname)" == "Darwin" ]]; then
+  if [[ ! -f "$CREDENTIALS_JSON" || ! -s "$CREDENTIALS_JSON" ]]; then
+    echo "[setup] Writing Claude credentials from macOS Keychain → $CREDENTIALS_JSON"
+    security find-generic-password -s "Claude Code-credentials" -w > "$CREDENTIALS_JSON"
+  fi
+else
+  echo "[info] Skipping macOS Keychain extraction, using existing ~/.claude/.credentials.json"
+fi
+
+# Clean build directory
+BUILD_DIR=$(mktemp -d)
+cleanup() {
+  echo "[cleanup] Removing temp build dir and stopping container (if any)..."
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  rm -rf "$BUILD_DIR"
+}
+trap cleanup EXIT INT TERM HUP
+
+# Generate language-specific Dockerfile content
+generate_dockerfile() {
+  cat > "$BUILD_DIR/Dockerfile" <<EOF
+FROM node:20-slim
+
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+ARG USER_NAME=claude
+
+# Base dependencies
+RUN apt-get update && apt-get install -y \\
+    git curl bash gnupg ca-certificates unzip wget \\
+    ripgrep build-essential jq \\
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI
+RUN type -p curl >/dev/null || (apt update && apt install curl -y) \\
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\
+ && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \\
+ && echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\
+ && apt update \\
+ && apt install gh -y \\
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+EOF
+
+  # Add language-specific installations for each selected language
+  for lang in "${LANGUAGES[@]}"; do
+    case "$lang" in
+      python)
+        cat >> "$BUILD_DIR/Dockerfile" <<'EOF'
+# Python development
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip python3-venv python3-dev \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --break-system-packages --upgrade pip && \
+    python3 -m pip install --break-system-packages poetry pipenv virtualenv
+
+EOF
+        ;;
+      
+      go)
+        cat >> "$BUILD_DIR/Dockerfile" <<'EOF'
+# Go development
+RUN wget -q https://go.dev/dl/go1.23.5.linux-amd64.tar.gz && \
+    tar -C /usr/local -xzf go1.23.5.linux-amd64.tar.gz && \
+    rm go1.23.5.linux-amd64.tar.gz
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH="/home/${USER_NAME}/go"
+ENV GOPROXY="https://proxy.golang.org,direct"
+
+EOF
+        ;;
+      
+      rust)
+        cat >> "$BUILD_DIR/Dockerfile" <<'EOF'
+# Rust development
+RUN apt-get update && apt-get install -y \
+    pkg-config libssl-dev \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rust
+ENV CARGO_HOME=/opt/rust
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+EOF
+        ;;
+      
+      dotnet)
+        cat >> "$BUILD_DIR/Dockerfile" <<'EOF'
+# .NET development
+RUN wget -q https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -O packages-microsoft-prod.deb && \
+    dpkg -i packages-microsoft-prod.deb && \
+    rm packages-microsoft-prod.deb && \
+    apt-get update && \
+    apt-get install -y dotnet-sdk-8.0 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
+ENV DOTNET_NOLOGO=1
+
+EOF
+        ;;
+      
+      node)
+        cat >> "$BUILD_DIR/Dockerfile" <<'EOF'
+# Node.js development (already included in base image)
+# Install additional Node.js tools
+RUN npm install -g yarn typescript ts-node nodemon
+
+EOF
+        ;;
+      
+      java)
+        cat >> "$BUILD_DIR/Dockerfile" <<'EOF'
+# Java development
+RUN apt-get update && apt-get install -y \
+    openjdk-17-jdk maven gradle \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+EOF
+        ;;
+      
+      ruby)
+        cat >> "$BUILD_DIR/Dockerfile" <<'EOF'
+# Ruby development
+RUN apt-get update && apt-get install -y \
+    ruby-full ruby-dev \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN gem install bundler
+
+EOF
+        ;;
+      
+      php)
+        cat >> "$BUILD_DIR/Dockerfile" <<'EOF'
+# PHP development
+RUN apt-get update && apt-get install -y \
+    php php-cli php-dev php-pear php-curl php-xml php-mbstring php-zip \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+EOF
+        ;;
+    esac
+  done
+
+  # Complete the Dockerfile
+  cat >> "$BUILD_DIR/Dockerfile" <<EOF
+
+# Create user
+RUN getent group \${GROUP_ID} || groupadd -g \${GROUP_ID} \${USER_NAME} && \\
+    useradd -m -u \${USER_ID} -g \${GROUP_ID} \${USER_NAME}
+
+ENV HOME=/home/\${USER_NAME}
+ENV PNPM_HOME=/usr/local/pnpm
+ENV PATH="\${PNPM_HOME}:\${PATH}"
+
+# Install pnpm and Claude Code
+RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN pnpm add -g @anthropic-ai/claude-code
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+USER \${USER_NAME}
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+EOF
+}
+
+# Generate appropriate Dockerfile
+generate_dockerfile
+
+# Create entrypoint that sets up all language-specific cache directories
+cat > "$BUILD_DIR/docker-entrypoint.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Setup cache directories for all installed languages
+EOF
+
+for lang in "${LANGUAGES[@]}"; do
+  case "$lang" in
+    python)
+      cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+# Python cache
+export PIP_CACHE_DIR=/opt/cache/pip
+mkdir -p "$PIP_CACHE_DIR"
+EOF
+      ;;
+    go)
+      cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+# Go cache
+export GOCACHE=/opt/cache/go-build
+export GOMODCACHE=/opt/cache/go-mod
+mkdir -p "$GOCACHE" "$GOMODCACHE"
+EOF
+      ;;
+    rust)
+      cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+# Rust cache
+export CARGO_HOME=/opt/cache/cargo
+mkdir -p "$CARGO_HOME"
+EOF
+      ;;
+    dotnet)
+      cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+# .NET cache
+export NUGET_PACKAGES=/opt/cache/nuget
+mkdir -p "$NUGET_PACKAGES"
+EOF
+      ;;
+    node)
+      cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+# Node.js cache
+export npm_config_cache=/opt/cache/npm
+export YARN_CACHE_FOLDER=/opt/cache/yarn
+export PNPM_HOME=/opt/cache/pnpm
+mkdir -p "$npm_config_cache" "$YARN_CACHE_FOLDER" "$PNPM_HOME"
+EOF
+      ;;
+    java)
+      cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+# Java cache
+export MAVEN_OPTS="-Dmaven.repo.local=/opt/cache/maven"
+export GRADLE_USER_HOME=/opt/cache/gradle
+mkdir -p /opt/cache/maven /opt/cache/gradle
+EOF
+      ;;
+    ruby)
+      cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+# Ruby cache
+export GEM_HOME=/opt/cache/gems
+export BUNDLE_PATH=/opt/cache/bundle
+mkdir -p "$GEM_HOME" "$BUNDLE_PATH"
+EOF
+      ;;
+    php)
+      cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+# PHP cache
+export COMPOSER_HOME=/opt/cache/composer
+mkdir -p "$COMPOSER_HOME"
+EOF
+      ;;
+  esac
+done
+
+# Complete the entrypoint
+cat >> "$BUILD_DIR/docker-entrypoint.sh" <<'EOF'
+
+# Setup settings.json to auto-enable bypass permissions mode
+SETTINGS_JSON="$HOME/.claude/settings.json"
+if [[ ! -f "$SETTINGS_JSON" ]]; then
+  echo "[setup] Creating settings.json with bypass permissions enabled"
+  cat > "$SETTINGS_JSON" <<'SETTINGS_EOF'
+{
+  "permissions": {
+    "allow": ["*"],
+    "deny": []
+  },
+  "disableBypassPermissionsMode": false,
+  "defaultMode": "allowAll",
+  "env": {},
+  "cleanupPeriodDays": 0
+}
+SETTINGS_EOF
+else
+  # Check if bypass permissions is already configured
+  if ! grep -q '"disableBypassPermissionsMode"' "$SETTINGS_JSON" 2>/dev/null; then
+    echo "[setup] Updating settings.json to enable bypass permissions mode"
+    # Create a backup just in case
+    cp "$SETTINGS_JSON" "$SETTINGS_JSON.bak"
+    # Use jq to update the JSON
+    TMP_SETTINGS=$(mktemp)
+    jq '. + {"disableBypassPermissionsMode": false, "defaultMode": "allowAll", "permissions": {"allow": ["*"], "deny": []}}' "$SETTINGS_JSON" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$SETTINGS_JSON"
+  fi
+fi
+
+exec claude --dangerously-skip-permissions
+EOF
+
+# Build container image
+echo "[build] Building Docker image with languages: ${LANGUAGES[*]}..."
+docker build -t "$IMAGE_NAME" \
+  --build-arg USER_ID="$USER_ID" \
+  --build-arg GROUP_ID="$GROUP_ID" \
+  "$BUILD_DIR"
+
+# Stop any existing container
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+# Build docker run command with AWS environment variables
+DOCKER_RUN_CMD=(
+  docker run --rm -it
+  --name "$CONTAINER_NAME"
+  --read-only
+  --cap-drop=ALL
+  --pids-limit=200
+  --memory=2g --memory-swap=2g
+  --tmpfs /tmp:exec,mode=1777
+  -v "$(pwd)":/workspace:rw
+  -v "$HOST_CACHE_DIR":/opt/cache:rw
+  -v "$HOST_HOME_CLAUDE":/home/$USER_NAME/.claude:rw
+  -v "$HOST_CLAUDE_JSON":/home/$USER_NAME/.claude.json:rw
+  -v "$HOME/.gitconfig:/home/$USER_NAME/.gitconfig:ro"
+  -v "$HOME/.ssh:/home/$USER_NAME/.ssh:ro"
+  -v "$HOME/.aws:/home/$USER_NAME/.aws:ro"
+  -w /workspace
+  -e HOME="/home/$USER_NAME"
+  -e USER="$USER_NAME"
+  -e USER_ID="$USER_ID"
+  -e GROUP_ID="$GROUP_ID"
+)
+
+# Pass through AWS environment variables if they exist
+[[ -n "${AWS_ACCESS_KEY_ID:-}" ]] && DOCKER_RUN_CMD+=(-e "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID")
+[[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] && DOCKER_RUN_CMD+=(-e "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY")
+[[ -n "${AWS_SESSION_TOKEN:-}" ]] && DOCKER_RUN_CMD+=(-e "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN")
+[[ -n "${AWS_REGION:-}" ]] && DOCKER_RUN_CMD+=(-e "AWS_REGION=$AWS_REGION")
+[[ -n "${AWS_DEFAULT_REGION:-}" ]] && DOCKER_RUN_CMD+=(-e "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION")
+[[ -n "${AWS_PROFILE:-}" ]] && DOCKER_RUN_CMD+=(-e "AWS_PROFILE=$AWS_PROFILE")
+[[ -n "${AWS_CONFIG_FILE:-}" ]] && DOCKER_RUN_CMD+=(-e "AWS_CONFIG_FILE=$AWS_CONFIG_FILE")
+[[ -n "${AWS_SHARED_CREDENTIALS_FILE:-}" ]] && DOCKER_RUN_CMD+=(-e "AWS_SHARED_CREDENTIALS_FILE=$AWS_SHARED_CREDENTIALS_FILE")
+
+# Pass through all ANTHROPIC and CLAUDE environment variables if they exist
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] && DOCKER_RUN_CMD+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+[[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]] && DOCKER_RUN_CMD+=(-e "ANTHROPIC_AUTH_TOKEN=$ANTHROPIC_AUTH_TOKEN")
+[[ -n "${ANTHROPIC_BASE_URL:-}" ]] && DOCKER_RUN_CMD+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
+[[ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]] && DOCKER_RUN_CMD+=(-e "ANTHROPIC_CUSTOM_HEADERS=$ANTHROPIC_CUSTOM_HEADERS")
+[[ -n "${ANTHROPIC_MODEL:-}" ]] && DOCKER_RUN_CMD+=(-e "ANTHROPIC_MODEL=$ANTHROPIC_MODEL")
+[[ -n "${ANTHROPIC_SMALL_FAST_MODEL:-}" ]] && DOCKER_RUN_CMD+=(-e "ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_SMALL_FAST_MODEL")
+[[ -n "${BASH_DEFAULT_TIMEOUT_MS:-}" ]] && DOCKER_RUN_CMD+=(-e "BASH_DEFAULT_TIMEOUT_MS=$BASH_DEFAULT_TIMEOUT_MS")
+[[ -n "${BASH_MAX_TIMEOUT_MS:-}" ]] && DOCKER_RUN_CMD+=(-e "BASH_MAX_TIMEOUT_MS=$BASH_MAX_TIMEOUT_MS")
+[[ -n "${BASH_MAX_OUTPUT_LENGTH:-}" ]] && DOCKER_RUN_CMD+=(-e "BASH_MAX_OUTPUT_LENGTH=$BASH_MAX_OUTPUT_LENGTH")
+[[ -n "${CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR:-}" ]] && DOCKER_RUN_CMD+=(-e "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=$CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR")
+[[ -n "${CLAUDE_CODE_API_KEY_HELPER_TTL_MS:-}" ]] && DOCKER_RUN_CMD+=(-e "CLAUDE_CODE_API_KEY_HELPER_TTL_MS=$CLAUDE_CODE_API_KEY_HELPER_TTL_MS")
+[[ -n "${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-}" ]] && DOCKER_RUN_CMD+=(-e "CLAUDE_CODE_MAX_OUTPUT_TOKENS=$CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+[[ -n "${CLAUDE_CODE_USE_BEDROCK:-}" ]] && DOCKER_RUN_CMD+=(-e "CLAUDE_CODE_USE_BEDROCK=$CLAUDE_CODE_USE_BEDROCK")
+[[ -n "${CLAUDE_CODE_USE_VERTEX:-}" ]] && DOCKER_RUN_CMD+=(-e "CLAUDE_CODE_USE_VERTEX=$CLAUDE_CODE_USE_VERTEX")
+[[ -n "${CLAUDE_CODE_SKIP_BEDROCK_AUTH:-}" ]] && DOCKER_RUN_CMD+=(-e "CLAUDE_CODE_SKIP_BEDROCK_AUTH=$CLAUDE_CODE_SKIP_BEDROCK_AUTH")
+[[ -n "${CLAUDE_CODE_SKIP_VERTEX_AUTH:-}" ]] && DOCKER_RUN_CMD+=(-e "CLAUDE_CODE_SKIP_VERTEX_AUTH=$CLAUDE_CODE_SKIP_VERTEX_AUTH")
+[[ -n "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-}" ]] && DOCKER_RUN_CMD+=(-e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+[[ -n "${DISABLE_AUTOUPDATER:-}" ]] && DOCKER_RUN_CMD+=(-e "DISABLE_AUTOUPDATER=$DISABLE_AUTOUPDATER")
+[[ -n "${DISABLE_BUG_COMMAND:-}" ]] && DOCKER_RUN_CMD+=(-e "DISABLE_BUG_COMMAND=$DISABLE_BUG_COMMAND")
+[[ -n "${DISABLE_COST_WARNINGS:-}" ]] && DOCKER_RUN_CMD+=(-e "DISABLE_COST_WARNINGS=$DISABLE_COST_WARNINGS")
+[[ -n "${DISABLE_ERROR_REPORTING:-}" ]] && DOCKER_RUN_CMD+=(-e "DISABLE_ERROR_REPORTING=$DISABLE_ERROR_REPORTING")
+[[ -n "${DISABLE_NON_ESSENTIAL_MODEL_CALLS:-}" ]] && DOCKER_RUN_CMD+=(-e "DISABLE_NON_ESSENTIAL_MODEL_CALLS=$DISABLE_NON_ESSENTIAL_MODEL_CALLS")
+[[ -n "${DISABLE_TELEMETRY:-}" ]] && DOCKER_RUN_CMD+=(-e "DISABLE_TELEMETRY=$DISABLE_TELEMETRY")
+[[ -n "${HTTP_PROXY:-}" ]] && DOCKER_RUN_CMD+=(-e "HTTP_PROXY=$HTTP_PROXY")
+[[ -n "${HTTPS_PROXY:-}" ]] && DOCKER_RUN_CMD+=(-e "HTTPS_PROXY=$HTTPS_PROXY")
+[[ -n "${MAX_THINKING_TOKENS:-}" ]] && DOCKER_RUN_CMD+=(-e "MAX_THINKING_TOKENS=$MAX_THINKING_TOKENS")
+[[ -n "${MCP_TIMEOUT:-}" ]] && DOCKER_RUN_CMD+=(-e "MCP_TIMEOUT=$MCP_TIMEOUT")
+[[ -n "${MCP_TOOL_TIMEOUT:-}" ]] && DOCKER_RUN_CMD+=(-e "MCP_TOOL_TIMEOUT=$MCP_TOOL_TIMEOUT")
+[[ -n "${MAX_MCP_OUTPUT_TOKENS:-}" ]] && DOCKER_RUN_CMD+=(-e "MAX_MCP_OUTPUT_TOKENS=$MAX_MCP_OUTPUT_TOKENS")
+
+# Launch container
+"${DOCKER_RUN_CMD[@]}" "$IMAGE_NAME"
