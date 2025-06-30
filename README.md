@@ -44,13 +44,40 @@ A wrapper script that allows you to run Claude Code in dangerous mode safely wit
 
 ## Usage
 
-Use `claude-safe` just like you would use the regular `claude` command:
+```
+Usage: claude-safe [OPTIONS]
+
+Options:
+  -l, --lang, --language <lang>  Specify language/platform (can be used multiple times)
+  -h, --help                     Show this help message
+
+Supported languages:
+  python  - Python with pip, poetry, virtualenv
+  go      - Go with go modules support
+  rust    - Rust with cargo
+  dotnet  - .NET Core/.NET 5+
+  node    - Node.js with npm, yarn, pnpm
+  java    - Java with Maven and Gradle
+  ruby    - Ruby with bundler
+  php     - PHP with composer
+```
+
+### Examples
 
 ```bash
-# Start an interactive session
+# Auto-detect language based on files in current directory
 claude-safe
 
-# Run with specific arguments
+# Specify a single language
+claude-safe --lang python
+
+# Specify multiple languages
+claude-safe --lang python --lang go
+
+# Short form with multiple languages
+claude-safe -l rust -l python -l node
+
+# Pass through Claude Code arguments
 claude-safe --continue
 
 # Work with files in your current directory
@@ -61,6 +88,7 @@ claude-safe
 The script will automatically:
 - Start a Docker container with Claude Code installed
 - Mount your current directory
+- Install language-specific tools based on your selection or auto-detection
 - Run Claude Code in dangerous mode
 - Clean up the container when you're done
 
