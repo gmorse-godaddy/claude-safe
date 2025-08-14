@@ -8,6 +8,7 @@ CONTAINER_NAME="claude-code-runner"
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)
 USER_NAME="claude"
+declare -a CLAUDE_ARGS=()
 
 # Languages array
 declare -a LANGUAGES=()
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  -l, --lang, --language <lang>  Specify language/platform (can be used multiple times)"
+      echo "  -carg, --claude-arg <arg>      Pass additional arguments to Claude Code (can be used multiple times)"
       echo "  -h, --help                     Show this help message"
       echo ""
       echo "Supported languages:"
@@ -42,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       echo "  $0 --lang python --lang go      # Python and Go"
       echo "  $0 -l rust -l python -l node    # Rust, Python, and Node.js"
       exit 0
+      ;;
+    -carg|--claude-arg)
+      CLAUDE_ARGS+=("$2")
+      shift 2
       ;;
     *)
       echo "Unknown option: $1"
@@ -398,7 +404,7 @@ else
   fi
 fi
 
-exec claude --dangerously-skip-permissions
+exec claude --dangerously-skip-permissions "$@"
 EOF
 
 # Build container image
@@ -476,4 +482,12 @@ DOCKER_RUN_CMD=(
 [[ -n "${MAX_MCP_OUTPUT_TOKENS:-}" ]] && DOCKER_RUN_CMD+=(-e "MAX_MCP_OUTPUT_TOKENS=$MAX_MCP_OUTPUT_TOKENS")
 
 # Launch container
-"${DOCKER_RUN_CMD[@]}" "$IMAGE_NAME"
+if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+  echo "Adding claude arguments ${CLAUDE_ARGS[*]}"
+  DOCKER_RUN_CMD+=("$IMAGE_NAME")
+  DOCKER_RUN_CMD+=("${CLAUDE_ARGS[@]}")
+else
+  DOCKER_RUN_CMD+=("$IMAGE_NAME")
+fi
+
+"${DOCKER_RUN_CMD[@]}"
